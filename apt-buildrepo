@@ -1,0 +1,938 @@
+#! /usr/bin/perl -w
+#
+#  apt-buildrepo: Generate an apt package repository
+#
+#  Copyright (c) 2024 Network RADIUS
+#
+#  This program is free software: you can redistribute it and/or
+#  modify it under the terms of the GNU General Public License as
+#  published by the Free Software Foundation, either version 3 of
+#  the License, or (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
+#  Matthew Newton
+#  20 May 2024
+#
+
+use strict;
+use vars qw($VERSION);
+$VERSION = "0.01";
+
+our $DEBUG = 0;
+
+use Getopt::Long qw(GetOptions);
+
+use POSIX qw/strftime/;
+use File::Temp;
+
+
+#
+#  Options passed in on the command line
+#
+my %opts = (
+	"root" => undef,
+	"pkgdir" => undef,
+	"conffile" => undef,
+	"suite" => undef,
+	"codename" => undef,
+	"origin" => undef,
+	"label" => undef,
+
+	"signby" => undef,
+	"gpgsecringfile" => undef,
+	"gpgpassfile" => undef,
+);
+
+
+#
+#  Print out the syntex/help text
+#
+sub syntax
+{
+	my $rc = shift;
+	my $errmsg = shift;
+
+	select STDERR if $rc > 0;
+
+	if ($errmsg) {
+		select STDERR;
+		print "error: $errmsg\n\n";
+	}
+
+	print <<"EOF";
+Syntax: $0 [options] <dir>
+
+  <dir> is the top-level repository directory.
+
+Options are:
+  -p <pkgdir>   - directory containing packages, relative to <dir>
+
+  -c <codename> - e.g. "buster"
+  -s <suite>    - e.g. "testing"
+
+  -O <origin>   - optional origin, e.g. "mycompany", added to the repo
+  -L <label>    - optional label, e.g. "development packages"
+
+  -r <keyname>  - name of gpg key to use for signing, repo will
+                  be unsigned if not set
+  -k <keyring>  - secret keyring file that contains the signing key
+  -P <gpgpass>  - file containing plaintext password for secret key
+
+  -h            - this help
+EOF
+
+	exit $rc;
+}
+
+
+#
+#  Package to handle file checksums
+#
+#  This currently calls out to other utilities (e.g. sha256sum)
+#  but could be updated to use perl modules instead.
+#
+#  We cache any checksums to save having to calculate them
+#  multiple times.
+#
+package FileChecksum;
+
+use strict;
+use Carp;
+
+sub new
+{
+	my ($class, %data) = @_;
+	my $self = {
+		"cache" => {}
+	};
+	bless $self, $class;
+	$self->init(\%data);
+}
+
+sub init
+{
+	my $self = shift;
+	my $data = shift;
+
+	$self->{"filename"} = $$data{"filename"};
+
+	return $self;
+}
+
+#
+#  Hacky way to calculate file checksum using CLI utils...
+#
+sub _read_sum
+{
+	my $self = shift;
+	my $utility = shift;
+	my $cs = "";
+
+	my $fn = $self->{"filename"};
+	my $FH;
+	my $cmd = "$utility '$fn'";
+
+	open $FH, "$cmd |" or die "unable to run '$cmd'";
+	my $cksum = <$FH>;
+	close $FH;
+
+	if ($cksum =~ /^([^\s]+)\s+(.*)$/) {
+		die "unknown output running $cmd" unless $2 eq $fn;
+		$cs = $1;
+	} else {
+		die "failure getting checksum using '$cmd'";
+	}
+
+	return $cs;
+}
+
+#
+#  Private method to do common checks before calculating a
+#  checksum
+#
+sub _checks
+{
+	my $self = shift;
+	croak "no filename set" unless defined $self->{"filename"};
+	croak "file " . $self->{"filename"} . " not readable" unless -r $self->{"filename"};
+}
+
+#
+#  Private methods to get and set checksum cache entries
+#
+sub _cache_get
+{
+	my $self = shift;
+	my $type = shift;
+
+	return undef unless defined $self->{"cache"}{$type};
+	return $self->{"cache"}{$type};
+}
+
+sub _cache_set
+{
+	my $self = shift;
+	my $type = shift;
+	my $value = shift;
+
+	$self->{"cache"}{$type} = $value;
+	return $value;
+}
+
+#
+#  Public methods to calculate different checksum types of a file
+#
+sub md5
+{
+	my $self = shift;
+	$self->_checks();
+	my $cache = $self->_cache_get("md5");
+	return $cache if defined $cache;
+	my $sum = $self->_read_sum("md5sum");
+	return $self->_cache_set("md5", $sum);
+}
+
+sub sha1
+{
+	my $self = shift;
+	$self->_checks();
+	my $cache = $self->_cache_get("sha1");
+	return $cache if defined $cache;
+	my $sum = $self->_read_sum("sha1sum");
+	return $self->_cache_set("sha1", $sum);
+}
+
+
+sub sha256
+{
+	my $self = shift;
+	$self->_checks();
+	my $cache = $self->_cache_get("sha256");
+	return $cache if defined $cache;
+	my $sum = $self->_read_sum("sha256sum");
+	return $self->_cache_set("sha256", $sum);
+}
+
+
+sub sha512
+{
+	my $self = shift;
+	$self->_checks();
+	my $cache = $self->_cache_get("sha512");
+	return $cache if defined $cache;
+	my $sum = $self->_read_sum("sha512sum");
+	return $self->_cache_set("sha512", $sum);
+}
+
+
+#
+#  Package to handle tasks related to a Debian .deb package file
+#
+package DebPackage;
+
+use strict;
+use Carp;
+
+sub new
+{
+	my ($class, %data) = @_;
+	my $self = {};
+	bless $self, $class;
+	$self->init(\%data);
+}
+
+sub init
+{
+	my $self = shift;
+	my $data = shift;
+
+	$self->{"filename"} = $$data{"filename"} || undef;
+
+	$self->readpkg() if defined $self->{"filename"};
+	return $self;
+}
+
+#
+#  Public method (usually just called from init) to read all
+#  information about a Debian package file
+#
+sub readpkg
+{
+	my $self = shift;
+	$self->{"pkgdata"} = {};
+
+	croak "no package filename set" unless defined $self->{"filename"};
+	croak "cannot read package '" . $self->{"filename"} . "'" unless -r $self->{"filename"};
+
+	if ($DEBUG) {
+		print "Reading package: ";
+		print $self->{"filename"} . "\n";
+	}
+
+	my $sum = FileChecksum->new("filename" => $self->{"filename"});
+	$self->{"pkgdata"}{"MD5sum"} = $sum->md5();
+	$self->{"pkgdata"}{"SHA1"} = $sum->sha1();
+	$self->{"pkgdata"}{"SHA256"} = $sum->sha256();
+	$self->{"pkgdata"}{"SHA512"} = $sum->sha512();
+	$self->read_deb_fields();
+	$self->read_deb_contents();
+
+	# Filename here will be incorrect for the repo, but is
+	# updated to the correct relative path elsewhere.
+	$self->{"pkgdata"}{"Filename"} = $self->{"filename"};
+	$self->{"pkgdata"}{"Size"} = (stat($self->{"filename"}))[7];
+}
+
+#
+#  Read control fields from package file
+#
+sub read_deb_fields
+{
+	my $self = shift;
+	my $fn = $self->{"filename"};
+	my $field;
+	my $data = $self->{"pkgdata"};
+
+	my $FH;
+
+	open $FH, "dpkg-deb -I '$fn' |" or die "unable to run dpkg-deb";
+	while (my $l = <$FH>) {
+		next if $l =~ /^ new Debian/;
+		next if $l =~ /^ size \d+ bytes/;
+		next if $l =~ /^\s+\d+ bytes/;
+		if ($l =~ /^ ([A-Za-z-]+):\s(.*)$/) {
+			$field = $1;
+			$data->{$field} = $2;
+		}
+		elsif ($field && $l =~ /^\s\s(.*)$/) {
+			$data->{$field} .= "\n$1";
+		}
+		else {
+			die "unknown dpkg output '$l'";
+		}
+
+	}
+	close $FH;
+}
+
+#
+#  Read contents of package file
+#
+#  Use `dpkg-deb` to do this for now as it's simplest.
+#
+sub read_deb_contents
+{
+	my $self = shift;
+	my $fn = $self->{"filename"};
+	my $field;
+	my @contents;
+
+	my $FH;
+
+	open $FH, "dpkg-deb -c '$fn' |" or die "unable to run dpkg-deb";
+	while (my $l = <$FH>) {
+		if ($l =~ /^
+			    [^\s]{10}
+			\s  [^\s\/]+\/[^\s\/]+
+			\s+ \d+
+			\s  \d{4}-\d\d-\d\d
+			\s+ \d\d:\d\d
+			\s+ .\/([^\s]+)
+			(?: \s+ -> .* )?
+			$/x) {
+			push @contents, $1 unless $1 =~ /\/$/;
+		}
+	}
+	close $FH;
+
+	$self->{"contents"} = \@contents;
+}
+
+#
+#  Store an attribute about this package
+#
+sub set_pkg_attr
+{
+	my $self = shift;
+	my $attr = shift;
+	my $value = shift;
+
+	$self->{"pkgdata"}{$attr} = $value;
+	return $value;
+}
+
+#
+#  Get a package attribute we already stored
+#
+sub get_pkg_attr
+{
+	my $self = shift;
+	my $attr = shift;
+
+	return $self->{"pkgdata"}{$attr};
+}
+
+#
+#  Get a list of all package attributes
+#
+sub get_all_attrs
+{
+	my $self = shift;
+	my @attrnames = keys %{$self->{"pkgdata"}};
+
+	return @attrnames;
+}
+
+#
+#  Get the list of all files contained in this package
+#
+sub get_pkg_contents
+{
+	my $self = shift;
+
+	return $self->{"contents"};
+}
+
+
+
+
+#
+#  The main program
+#
+package main;
+
+
+#
+#  Search the archive root for all debian packages (except in the
+#  "dists" directory, which is where the repo control files go.
+#
+sub search_package_files
+{
+	my $dir = shift;
+	my @pkgs = ();
+	my @dirs = ();
+
+	$dir =~ s/\/+$//;
+	if ($dir eq $opts{"root"}."/dists") {
+		print "skipping dists dir\n" if $DEBUG > 2;
+		return ();
+	}
+
+	print "> entering $dir\n" if $DEBUG > 2;
+
+	my $D;
+	opendir($D, $dir) or die "can't open directory $dir";
+	while (my $name = readdir($D)) {
+		next if $name =~ /^\.\.?$/;
+		if (-d "$dir/$name") {
+			push @dirs, $name;
+		}
+		elsif ($name =~ /\.deb$/) {
+			push @pkgs, "$dir/$name";
+		}
+	}
+	closedir($D);
+
+	#  Recurse subdirectories
+	foreach my $subdir (@dirs) {
+		push @pkgs, search_package_files("$dir/$subdir");
+	}
+
+	print "< done with $dir\n" if $DEBUG > 2;
+
+	return @pkgs;
+}
+
+#
+#  Given an array of .deb filenames, create a new DebPackage
+#  object for each one containing all the package attributes,
+#  checksums, contents, etc.
+#
+sub scan_packages
+{
+	my $pkgfiles = shift;
+	my $aroot = $opts{"root"};
+
+	my @packages = ();
+
+	foreach my $pkgfile (@$pkgfiles) {
+		print "adding package $pkgfile\n" if $DEBUG > 1;
+
+		my $pkg = new DebPackage(filename => $pkgfile);
+		push @packages, $pkg;
+
+		#
+		#  Set correct filename for package relative to archive root
+		#
+		my $relfile = $pkgfile;
+		$relfile =~ s+^$aroot/++;
+		$pkg->set_pkg_attr("Filename", $relfile);
+	}
+
+	return \@packages;
+}
+
+#
+#  Get unique list of all architectures from list of package objects
+#
+sub find_archs
+{
+	my $packages = shift;
+	my %archs = ();
+
+	foreach my $pkg (@$packages) {
+		my $pkgarch = $pkg->get_pkg_attr("Architecture");
+		$archs{$pkgarch} = 1;
+	}
+
+	my @a = sort keys %archs;
+	return \@a;
+}
+
+
+#
+#  Generate all repos for all packages
+#
+sub make_repo
+{
+	my $packages = shift;
+
+	#
+	#  Get an array of all used architectures
+	#
+	my $archs = find_archs($packages);
+
+	#
+	#  Only support main for now, this script is supposed to be simple
+	#
+	my $component = "main";
+
+	#
+	#  Possibly write to tmpdir and rename after all files
+	#  created? For now just write directly to dists
+	#
+	my $distsdirname = "dists";
+
+	#
+	#  Some common paths
+	#
+	my $distsdir = $opts{"root"} . "/$distsdirname";
+	my $suitedir = $distsdir . "/" . $opts{"suite"};
+	my $codedir = $distsdir . "/" . $opts{"codename"};
+	my $componentdir = $codedir . "/" . $component;
+
+	#
+	#  Make required directories. Should we wipe the dists dir
+	#  here too?
+	#
+	mkdir($distsdir);
+	die "unable to make '$distsdir'" unless -d $distsdir;
+	mkdir($codedir);
+	die "unable to mkdir '$codedir'" unless -d $codedir;
+	mkdir($componentdir);
+	die "unable to mkdir '$componentdir'" unless -d $componentdir;
+
+	my @indexfiles = ();
+
+	#
+	#  Create the "binary-N" directory for each architecture found
+	#
+	foreach my $arch (@$archs) {
+		#  There shouldn't be a "binary-all" directory in the repo.
+		next if $arch eq "all";
+
+		my $binarydir = $componentdir . "/binary-" . $arch;
+		my $packagesfile = $binarydir . "/Packages";
+		my $contentsfile = $componentdir . "/Contents-" . $arch;
+		my $reldir = $component . "/binary-" . $arch;
+
+		my $archreleasefile = $binarydir . "/Release";
+		mkdir($binarydir);
+		write_arch_release_file($archreleasefile, $arch, $component);
+		push @indexfiles, $reldir . "/Release";
+
+		write_packages_file($packagesfile, $packages, $arch);
+		do_compress("gzip", $packagesfile, $packagesfile.".gz");
+		do_compress("bzip2", $packagesfile, $packagesfile.".bz2");
+		push @indexfiles, $reldir . "/Packages";
+		push @indexfiles, $reldir . "/Packages.gz";
+		push @indexfiles, $reldir . "/Packages.bz2";
+
+		write_contents_file($contentsfile, $packages, $arch);
+		do_compress("gzip", $contentsfile, $contentsfile.".gz");
+		unlink($contentsfile);
+
+		push @indexfiles, $component . "/Contents-" . $arch . ".gz";
+	}
+
+	#
+	#  Write and sign the top-level Release file
+	#
+	write_release_file(
+		"topdir" => $codedir,
+		"archs" => $archs,
+		"components" => [$component],
+		"indexes" => \@indexfiles,
+		);
+
+	sign_release_file($codedir);
+}
+
+#
+#  Write the Release file for a given architecture
+#
+sub write_arch_release_file
+{
+	my $file = shift;
+	my $arch = shift;
+	my $component = shift;
+
+	my $FH;
+	open $FH, ">", $file or die "unable to open '$file' for writing";
+	print $FH "Origin: " . $opts{"origin"} . "\n" if defined $opts{"origin"};
+	print $FH "Label: " . $opts{"label"} . "\n" if defined $opts{"label"};
+	print $FH "Archive: " . $opts{"codename"} . "\n";
+	print $FH "Architecture: " . $arch . "\n";
+	print $FH "Component: " . $component . "\n";
+	close $FH;
+}
+
+#
+#  Write the Release file for the whole repository
+#
+sub write_release_file
+{
+	my %relopt = @_;
+
+	my $top = $relopt{"topdir"} . "/";
+	my %indexsums;
+	my %filesizes;
+	my $maxlen = 1;
+
+	foreach my $indexfile (@{$relopt{"indexes"}}) {
+
+		my $size = (stat($top . $indexfile))[7];
+		$filesizes{$indexfile} = $size;
+
+		if (length($size) > $maxlen) {
+			$maxlen = length($size);
+		}
+
+		my $sum = FileChecksum->new("filename" => $top . $indexfile);
+
+		if (my $s = $sum->md5()) {
+			$indexsums{"MD5Sum"}{$indexfile} = $s;
+		}
+		if (my $s = $sum->sha1()) {
+			$indexsums{"SHA1"}{$indexfile} = $s;
+		}
+		if (my $s = $sum->sha256()) {
+			$indexsums{"SHA256"}{$indexfile} = $s;
+		}
+		if (my $s = $sum->sha512()) {
+			$indexsums{"SHA512"}{$indexfile} = $s;
+		}
+	}
+
+
+	my $FH;
+	open $FH, ">", $top . "Release";
+	print $FH "Origin: " . $opts{"origin"} . "\n" if defined $opts{"origin"};
+	print $FH "Label: " . $opts{"label"} . "\n" if defined $opts{"label"};
+	print $FH "Suite: " . $opts{"suite"} . "\n";
+	print $FH "Codename: " . $opts{"codename"} . "\n";
+	print $FH "Date: " . strftime("%a, %d %b %Y %T +0000", gmtime()) . "\n";
+	print $FH "Architectures: " . join(" ", @{$relopt{"archs"}}) . "\n";
+	print $FH "Components: " . join(" ", @{$relopt{"components"}}) . "\n";
+	print $FH "Description: Generated by apt-buildrepo\n";
+
+	foreach my $sum (sort keys %indexsums) {
+		print $FH "$sum:\n";
+		my @files = sort keys %{$indexsums{$sum}};
+		foreach my $f (@files) {
+			my $filesize = $filesizes{$f};
+			my $size = (" " x ($maxlen - length($filesize))) . $filesize;
+			print $FH " " . $indexsums{$sum}{$f} .
+				" " . $size .
+				" " . $f . "\n";
+		}
+	}
+
+	close $FH;
+}
+
+#
+#  The top-level Release file should be signed, both inline
+#  (InRelease) and separate (Release.gpg). gnupg is awful, but we
+#  do our best...
+#
+sub sign_release_file
+{
+	my $dir = shift;
+
+	my $release = $dir . "/Release";
+	my $inrelease = $dir . "/InRelease";
+	my $signed = $dir . "/Release.gpg";
+	my $gpgcmd = "gpg --pinentry-mode=loopback --batch";
+
+	#
+	#  Even if we can't write new signed files, always remove the old ones
+	#  as they'll be invalid after creating a new Release file.
+	#
+	unlink $inrelease if -e $inrelease;
+	unlink $signed if -e $signed;
+
+	#
+	#  We need a signing key otherwise we can't do anything at all
+	#
+	return unless defined $opts{"signby"};
+
+	if (defined $opts{"gpgpassfile"}) {
+		$gpgcmd .= " --passphrase-file '" . $opts{"gpgpassfile"} . "'";
+	}
+
+	#
+	#  If a GPG secret keyring is provided then we need to import it. We
+	#  also need a temporary key dir to import to. Otherwise we rely on the
+	#  caller having set $GPGHOME if necessary.
+	#
+	my $gpghome = undef;
+	my $tmpdir = undef;
+	if (defined $opts{"gpgsecringfile"}) {
+		$tmpdir = File::Temp->newdir();
+		$gpghome = $tmpdir->dirname() . "/gpg";
+		mkdir $gpghome;
+		chmod 0700, $gpghome;
+		$gpgcmd .= " --homedir '$gpghome'";
+
+		system("$gpgcmd --import '" . $opts{"gpgsecringfile"} . "'");
+	}
+
+	#
+	#  We should now be able to sign the Release files
+	#
+	system("$gpgcmd --armor --sign --clearsign --output '$inrelease' '$release'");
+	system("$gpgcmd --armor --sign --detach-sign --output '$signed' '$release'");
+
+	#
+	# When tmpdir goes out of scope, File::Temp will wipe the
+	# contents. undef just to make sure.
+	#
+	undef $tmpdir;
+}
+
+#
+#  Write the architecture Packages file, which contains details of
+#  all the packages in that architecture (or "all")
+#
+sub write_packages_file
+{
+	my $file = shift;
+	my $packages = shift;
+	my $arch = shift;
+	my @attr_order = qw/
+			Package Priority Section Installed-Size Maintainer
+			Architecture Source Version Provides Depends Breaks
+			Recommends Suggests Filename Size MD5sum SHA1 SHA256
+			SHA512 Description Homepage
+		/;
+
+	my $FH;
+
+	open $FH, ">", $file or die "unable to open '$file' for writing";
+	foreach my $package (@$packages) {
+		my $pa = $package->get_pkg_attr("Architecture");
+		next unless $pa eq $arch or $pa eq "all";
+
+		my @allattrs = $package->get_all_attrs();
+		my %allattrs = map { $_ => 1 } @allattrs;
+
+		# write all standard keys in order
+		foreach my $attr (@attr_order) {
+			write_packages_field($FH, $package, $attr);
+			delete $allattrs{$attr};
+		}
+		# add any extra keys from the package that we missed above
+		foreach my $attr (sort keys %allattrs) {
+			write_packages_field($FH, $package, $attr);
+		}
+		print $FH "\n";
+	}
+	close $FH;
+}
+
+#
+#  Write an individual field - needs to handle multi-line fields
+#
+sub write_packages_field
+{
+	my $fh = shift;
+	my $pkg = shift;
+	my $field = shift;
+
+	my $value = $pkg->get_pkg_attr($field);
+	return 0 unless defined $value;
+	$value =~ s/\n/\n /gs;
+	print $fh "$field: $value\n";
+	return 1;
+}
+
+#
+#  Write the Contents file for an architecture, which lists the
+#  file contents of all available packages
+#
+sub write_contents_file
+{
+	my $file = shift;
+	my $packages = shift;
+	my $arch = shift;
+
+	my %contents = ();
+	my $FH;
+
+	foreach my $package (@$packages) {
+		my $pa = $package->get_pkg_attr("Architecture");
+		next unless $pa eq $arch or $pa eq "all";
+
+		# We just hope that the section is the same in multiple
+		# versions of the same package. If not, ....?
+		my $section = $package->get_pkg_attr("Section");
+		my $pkgname = $package->get_pkg_attr("Package");
+		my $location = $section . "/" . $pkgname;
+
+		my $pkgcontents = $package->get_pkg_contents();
+
+		foreach my $pkgfile (@$pkgcontents) {
+			$contents{$pkgfile} = $location;
+		}
+	}
+
+	open $FH, ">", $file or die "unable to open '$file' for writing";
+	print $FH "FILE LOCATION\n";
+	foreach my $pkgfile (sort keys %contents) {
+		print $FH $pkgfile . " " . $contents{$pkgfile} . "\n";
+	}
+	close $FH;
+}
+
+#
+#  Compress a file. Currently by calling an external utility
+#
+sub do_compress
+{
+	my $compress = shift;
+	my $source = shift;
+	my $dest = shift;
+
+	system("$compress -c '$source' > '$dest'");
+}
+
+
+#
+#  Get command-line arguments
+#
+Getopt::Long::Configure qw(gnu_getopt);
+
+GetOptions(
+	'pkgdir|p=s'	=> \$opts{"pkgdir"},
+
+	'codename|c=s'	=> \$opts{"codename"},
+	'suite|s=s'	=> \$opts{"suite"},
+
+	'origin|O=s'	=> \$opts{"origin"},
+	'label|L=s'	=> \$opts{"label"},
+
+	'keyname|r=s'	=> \$opts{"signby"},
+	'keyring|k=s'	=> \$opts{"gpgsecringfile"},
+	'passfile|P=s'	=> \$opts{"gpgpassfile"},
+
+	'help|h'	=> \$opts{"help"},
+) or syntax(1, "bad options");
+
+
+#
+#  Process args and do sanity checks
+#
+#  This is the time to read a config file, if that ability is
+#  added in future
+#
+
+syntax(0) if $opts{"help"};
+$opts{"root"} = $ARGV[0];
+syntax(1, "no root directory given") unless defined $opts{"root"};
+
+#
+#  Check root exists
+#
+$opts{"root"} =~ s/\/+$//;
+die "root directory '".$opts{"root"}."' does not exist"
+	unless -d $opts{"root"};
+
+#
+#  Check pkgdir exists
+#
+$opts{"pkgdir"} = "" unless defined $opts{"pkgdir"};
+
+#
+#  Check pkgdir under root
+#
+die "package directory '".$opts{"root"}."/".$opts{"pkgdir"}."' does not exist"
+	unless -d $opts{"root"};
+
+#
+#  Check codename
+#
+die "no codename given (-c)" unless defined $opts{"codename"};
+$opts{"suite"} = $opts{"suite"} || $opts{"codename"};
+
+#
+#  Check packages dir has been set (must be under the root)
+#
+syntax(1, "need packages dir") unless defined $opts{"pkgdir"};
+
+#
+#  Sanity check the signing options
+#
+if (defined $opts{"gpgpassfile"} and ! -r $opts{"gpgpassfile"}) {
+	die "gpg password file '" . $opts{"gpgpassfile"} . "' not readable";
+}
+
+if (defined $opts{"gpgsecringfile"} and ! -r $opts{"gpgsecringfile"}) {
+	die "gpg secret keyring file '" . $opts{"gpgpassfile"} . "' not readable";
+}
+
+
+#
+#  On to the real stuff - search the packages directory and get a
+#  list of all .deb package files found
+#
+my @p = search_package_files($opts{"root"} . "/" . $opts{"pkgdir"});
+
+if ($DEBUG) {
+	print "Found packages:\n";
+	foreach my $pkg (sort @p) {
+		print "  - $pkg\n";
+	}
+}
+
+#
+#  Read information about all the packages
+#
+my $packages = scan_packages(\@p);
+
+#
+# TODO Check for duplicates (package name, architecture, version)
+#
+#check_package_duplicates(\@p);
+
+#
+#  Create the repository files
+#
+make_repo($packages);
