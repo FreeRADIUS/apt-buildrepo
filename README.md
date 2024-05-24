@@ -49,6 +49,8 @@ nothing but a single script to run. Most heavy lifting (e.g. calculating
 checksums) is done by running external commands. Only one repo component
 ("main") is currently supported, again to keep things simple.
 
+The generated repository is based on https://wiki.debian.org/DebianRepository/Format
+
 
 Dependencies
 ------------
@@ -58,6 +60,7 @@ Several standard utilities are required:
 - `md5sum`, `sha1sum`, `sha256sum`, `sha512sum`, for file checksums
 - `dpkg-deb` to read package information
 - `gnupg`, for file signing
+- `gzip` and `bzip2` for file compression
 
 
 Usage
