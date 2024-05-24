@@ -143,6 +143,27 @@ script will generally just overwrite the same files anyway):
 and re-run the `apt-buildrepo` command above.
 
 
+Testing the generated repository
+--------------------------------
+
+A Docker `docker-compose.yml` file is included which will build several
+containers to test that the repository is generated correctly:
+
+- `packages`, which will generate a test GPG key and test package
+- `server`, which generates a repository and serves it over HTTP
+- `client-*`, which are a variety of Debian images to try and install the package
+
+To use, run:
+
+    docker compose down
+    docker compose build
+    docker compose up
+
+Once all the containers have completed successfully, press Ctrl-C to quit the
+running server. Alternatively, while it is still running, you can browse to
+http://localhost:8888 to view the generated repository.
+
+
 Future potential improvements
 -----------------------------
 

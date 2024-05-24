@@ -1,0 +1,80 @@
+#
+#  use 'docker compose up' to start, not 'docker-compose up'
+#
+name: apt-buildrepo
+
+services:
+  packages:
+    build:
+      dockerfile: test/packages/Dockerfile
+    volumes:
+      - ./test:/data
+    stop_grace_period: 1s
+
+  server:
+    depends_on:
+      packages:
+        condition: service_completed_successfully
+    build:
+      dockerfile: test/server/Dockerfile
+    volumes:
+      - ./test:/data
+    ports:
+      - 8888:80
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost/"]
+      start_period: 5s
+      retries: 20
+      interval: 2s
+      timeout: 10s
+    stop_grace_period: 1s
+
+  client-debian-12:
+    depends_on:
+      server:
+        condition: service_healthy
+    build:
+      dockerfile: test/client/Dockerfile
+      args:
+        from: debian:12
+    volumes:
+      - ./test:/data
+
+  client-debian-11:
+    depends_on:
+      server:
+        condition: service_healthy
+      client-debian-12:
+        condition: service_completed_successfully
+    build:
+      dockerfile: test/client/Dockerfile
+      args:
+        from: debian:11
+    volumes:
+      - ./test:/data
+
+  client-debian-10:
+    depends_on:
+      server:
+        condition: service_healthy
+      client-debian-11:
+        condition: service_completed_successfully
+    build:
+      dockerfile: test/client/Dockerfile
+      args:
+        from: debian:10
+    volumes:
+      - ./test:/data
+
+  client-debian-9:
+    depends_on:
+      server:
+        condition: service_healthy
+      client-debian-10:
+        condition: service_completed_successfully
+    build:
+      dockerfile: test/client/Dockerfile
+      args:
+        from: debian:9
+    volumes:
+      - ./test:/data
